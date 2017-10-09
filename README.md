@@ -83,11 +83,5 @@ You will probably see frequent socket errors from PacketFu if the network connec
 
 Forum: <a href="http://forums.kali.org/showthread.php?18323-Spoofa-an-Arpspoof-replacement" target="_blank">Spoofa thread in kali linux forum</a>
 
-### Author
 
-VulpiArgenti (SilverFoxx) (C) 2013
-
-### Licence
-
-GPL. See LICENSE for licensing details.
 
