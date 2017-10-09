@@ -1,0 +1,2 @@
+# spoof
+www.easypc.ir
